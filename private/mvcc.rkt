@@ -1,0 +1,488 @@
+#lang racket/base
+
+(require ffi/unsafe/atomic (for-syntax racket/base syntax/parse) racket/stxparam racket/set racket/list "heap.rkt" "queue.rkt")
+(provide exn:fail:transaction? exn:fail:transaction:not-in-transaction? completed-write-transactions)
+(provide make-vbox vbox-ref vbox-set! vbox-cas! transaction-rollback with-transaction)
+
+;(define atomic-semaphore (make-semaphore 1))
+;(define (start-atomic) (semaphore-wait atomic-semaphore))
+;(define (end-atomic) (semaphore-post atomic-semaphore))
+
+;(define start-atomic void)
+;(define end-atomic void)
+
+(struct vbox ([body #:mutable])
+  #:methods gen:custom-write
+  [(define (write-proc vb port mode)
+     (define value (vbox-ref vb))
+     (case mode
+       [(#t) (display "#*" port) (write value port)]
+       [(#f) (display value port)]
+       [else (display "(make-vbox " port)
+             (print value port mode)
+             (display ")")]))])
+
+(struct vbody (id value [next #:mutable]))
+(struct transaction-stack ([id #:mutable] [count #:mutable] [length #:mutable] read-set [write-tables #:mutable] [abort #:mutable] [restart #:mutable] semaphore
+                                          [modes #:mutable] [record #:mutable] [queues #:mutable] [in-restartable? #:mutable] restartable-queue [state #:mutable]) #:transparent) 
+(struct transaction-record (id [writes #:mutable] semaphore))
+(struct restartable-method-record (read-set [return #:mutable] proc))
+
+(define initial-size 4)
+(struct exn:fail:transaction exn:fail () #:transparent #:extra-constructor-name make-exn:fail:transaction)
+(struct exn:fail:transaction:not-in-transaction exn:fail:transaction () #:transparent #:extra-constructor-name make-exn:fail:transaction:not-in-transaction)
+
+(define (raise-transaction-error who message)
+  (raise (make-exn:fail:transaction (format "~a: ~a" who message) (current-continuation-marks))))
+
+(define (raise-not-in-transaction-error who message)
+  (raise (make-exn:fail:transaction:not-in-transaction (format "~a: ~a" who message) (current-continuation-marks))))
+
+
+
+
+(define current-transaction (make-thread-cell #f))
+;(define transaction-state-cell (make-thread-cell 'none))
+
+;; TransactionState is one of 'none 'transaction 'commit 'restart
+;; none - no active transaction
+;; transaction - one or more active transactions
+;; commit - in the process of committing a transaction (this will occur during the execution of any defered procedure calls)
+;; restart - in atomic mode to retry a restartable method
+
+(define completed-write-transactions 0)
+
+
+(define (compatible-modes? parent child)
+  (or (eq? parent 'read/write)
+      (eq? child parent)
+      (and (eq? parent 'read) (eq? child 'read:restart))))
+
+
+(define (transaction-stack-mode t)
+  (vector-ref (transaction-stack-modes t) 0))
+
+(define (restartable-read-set t)
+  (restartable-method-record-read-set (queue-peek-back (transaction-stack-restartable-queue t))))
+
+(define (transaction-reads t)
+  (if (transaction-stack-in-restartable? t)
+      (restartable-read-set t)
+      (transaction-stack-read-set t)))
+
+;; for internal use only
+
+;; modes: read write read/write read:restart
+
+(define (transaction-begin mode abort-thunk restart-thunk [restartable-method-thunk #f])
+  (unless (thread-cell-ref current-transaction)
+    (thread-cell-set! current-transaction
+                      (transaction-stack #f 0 initial-size (mutable-seteq) (build-vector initial-size (lambda (i) (make-hasheq))) #f #f
+                                         (make-semaphore 0) (make-vector initial-size #f) #f 
+                                         (build-vector initial-size (lambda (i) (make-queue))) #f (make-queue) 'none)))
+  (define t (thread-cell-ref current-transaction))
+  (when (= (transaction-stack-count t) (transaction-stack-length t))
+    (let ([ns (arithmetic-shift (transaction-stack-length t) 1)]
+          [old-tables (transaction-stack-write-tables t)]
+          [old-queues (transaction-stack-queues t)]
+          [old-modes (transaction-stack-modes t)])
+      (set-transaction-stack-length! t ns)
+      (set-transaction-stack-write-tables! t (build-vector ns #f))
+      (vector-copy! (transaction-stack-write-tables t) 0 old-tables)
+      (set-transaction-stack-queues! t (build-vector ns #f))
+      (vector-copy! (transaction-stack-queues t) 0 old-queues)
+      (set-transaction-stack-modes! t (build-vector ns #f))
+      (vector-copy! (transaction-stack-modes t) 0 old-modes)
+      (for ([i (in-range (vector-length old-tables) ns)])
+        (vector-set! (transaction-stack-write-tables t) i (make-hasheq))
+        (vector-set! (transaction-stack-queues t) i (make-queue)))))
+  (define outer-mode (transaction-stack-mode t))
+  (when (and (eq? mode 'read:restart) (or (zero? (transaction-stack-count t))
+                                          (transaction-stack-in-restartable? t)))
+    (set! mode 'read)) ; top level restartables become regular reads, nested restartables also become regular reads
+  (vector-set! (transaction-stack-modes t) (transaction-stack-count t) mode)
+
+  (cond [(zero? (transaction-stack-count t)) ; top level transaction
+         ;; at the top level a restartable transaction is the same as a regular read-only transaction, no special case
+         (set-transaction-stack-state! t 'transaction)
+         (set-transaction-stack-id! t completed-write-transactions)
+         (set-transaction-stack-abort! t abort-thunk) ;; in the future, the abort continuation will be used for something cool
+         (set-transaction-stack-restart! t restart-thunk)
+         (when (eq? mode 'read/write) (set-clear! (transaction-stack-read-set t)))
+         (unless (or (eq? mode 'read) (eq? mode 'read:restart)) ; read doesn't need write tables, but any write mode does
+           (hash-clear! (vector-ref (transaction-stack-write-tables t) 0)))
+         (queue-clear! (transaction-stack-restartable-queue t))
+         (add-transaction t)
+         ; (struct restartable-method-record (read-set [return #:mutable] proc))
+         ]
+        [(and restartable-method-thunk (not (transaction-stack-in-restartable? t)))
+         (queue-add-back! (transaction-stack-restartable-queue t) (restartable-method-record (mutable-seteq) #f restartable-method-thunk))
+         (set-transaction-stack-in-restartable?! t #t)]
+        [(compatible-modes? outer-mode mode)
+         (unless (eq? outer-mode 'read) ; read doesn't need write tables, but any write mode does
+           (hash-clear! (vector-ref (transaction-stack-write-tables t) (transaction-stack-count t))))]
+        [(and (or (eq? mode 'read/write)
+                  (eq? mode 'write))
+              (transaction-stack-in-restartable? t))
+         (raise-transaction-error 'transaction-start "nested write mode not permitted during restartable read method")]
+        [else
+         (transaction-restart)])
+  (set-transaction-stack-count! t (add1 (transaction-stack-count t)))
+  t)
+
+(define (transaction-restart)
+  (define t (thread-cell-ref current-transaction))
+  ;; restarts happen because: read-only or write-only hint was wrong, or a stale read occurred during read/write
+  ;; therefore: mode is always read/write after a mid-transaction restart
+  (vector-set! (transaction-stack-modes t) 0 'read/write) ; TODO: what about restartable methods?
+  ;; escape continuation with indication of incomplete transaction (do not attempt to commit, roll back and restart in read/write mode)
+  ((transaction-stack-restart t) 'incomplete))
+
+;; (make-vbox initial) creates a vbox with value initial
+;; make-vbox: X -> (VBoxof X)
+
+(define (make-vbox initial)
+  (vbox (vbody completed-write-transactions initial #f)))
+
+;; (vbox-ref vb) returns vb's value.
+;; vbox-ref: (VBoxof X) -> X
+;;   if in transaction: vb's value is the last value written during current transaction, or else vb's value at the moment transaction was started
+;;   if not in transaction: vb's value is the most recent committed value
+
+(define (vbox-ref vb)
+  (let* ([t (thread-cell-ref current-transaction)]
+         [id (and t (transaction-stack-id t))]
+         [state (and t (transaction-stack-state t))])
+    (case state
+      [(commit)
+       (raise-transaction-error 'vbox-ref "illegal vbox access during defered procedure call")]
+      [(transaction)
+       (define body
+         ;; Walk backward in transactions looking for a write to vb
+         ;; if none found, use vb's global history
+         (let loop ([i (sub1 (transaction-stack-count t))])
+           (cond [(negative? i)
+                  (set-add! (transaction-reads t) vb)
+                  (vbox-body vb)]
+                 [(hash-has-key? (vector-ref (transaction-stack-write-tables t) i) vb)
+                  (hash-ref (vector-ref (transaction-stack-write-tables t) i) vb)]
+                 [else (loop (sub1 i))])))
+       ;; If using vb's global history, walk back in time to the most recent write from before t began
+       (if (vbody? body)
+           (let loop ([body body])
+             (if (<= (vbody-id body) id)
+                 (vbody-value body)
+                 (loop (vbody-next body))))
+           body)]
+      [else ; not in transaction, or read is part of restartable read and therefore atomic
+       (vbody-value (vbox-body vb))])))
+
+
+;; (vbox-set! vb v) sets versioned-box vb to value v within the current transaction
+;;   if no current transaction, immediately commits a write-only transaction that writes v to vb
+
+(define (vbox-set! vb v)
+  (define t (thread-cell-ref current-transaction))
+  (cond
+    [(and t (or (eq? (transaction-stack-state t) 'commit)
+                (eq? (transaction-stack-state t) 'restart)))
+     (raise-transaction-error 'vbox-set! "illegal vbox access during defered procedure call")]
+    [(and t (eq? (transaction-stack-state t) 'transaction))
+     (when (transaction-stack-in-restartable? t)
+       (raise-transaction-error 'vbox-set! "write access attempted in read-only method transaction"))
+     (hash-set! (vector-ref (transaction-stack-write-tables t)
+                            (sub1 (transaction-stack-count t)))
+                vb v)]
+    [else
+     (start-atomic)
+     (set! completed-write-transactions (add1 completed-write-transactions))
+     (set-vbox-body! vb (vbody completed-write-transactions v (vbox-body vb)))
+     (define r (transaction-record completed-write-transactions
+                                   (hasheq vb v)
+                                   #f))
+     (end-atomic)
+     (add-transaction-record r)]))
+
+
+(define (vbox-cas! vb proc)
+  (define t (thread-cell-ref current-transaction))
+  (cond [(and t (or (eq? (transaction-stack-state t) 'commit)
+                    (eq? (transaction-stack-state t) 'restart)))
+         (raise-transaction-error 'vbox-cas! "illegal vbox access during defered procedure call")]
+        [(and t (eq? (transaction-stack-state t) 'transaction))
+         (when (transaction-stack-in-restartable? t)
+           (raise-transaction-error 'vbox-cas! "write access attempted in read-only method transaction"))
+         (vbox-set! vb (proc (vbox-ref vb)))] ; if in transaction, cas is nothing special, just a read and a write
+        [else
+         (let loop ()
+           (define v (vbox-ref vb))  
+           (define v-prime (proc v)) 
+           (start-atomic)
+           (cond [(eq? v (vbox-ref vb))
+                  (set! completed-write-transactions (add1 completed-write-transactions))
+                  (set-vbox-body! vb (vbody completed-write-transactions v-prime (vbox-body vb)))
+                  (define r (transaction-record completed-write-transactions ; transaction of 1 read/write
+                                                (hasheq vb v)
+                                                #f)) ; no sense wasting a semaphore, it's already finished
+                  (end-atomic)
+                  (add-transaction-record r)]
+                 [else
+                  (end-atomic)
+                  (loop)]))])) ; commit failed, retry
+
+         
+
+(define (transaction-consistent? t)
+  (define id (transaction-stack-id t))
+  (andmap (lambda (vb)
+            (<= (vbody-id (vbox-body vb)) id))
+          (set->list (transaction-stack-read-set t))))
+
+(define (transaction-restartables-consistent? t)
+  (let ([q (transaction-stack-restartable-queue t)]
+        [id (transaction-stack-id t)]
+        [old-state (transaction-stack-state t)])
+    (set-transaction-stack-state! t 'restartable)
+    (begin0
+      (if (queue-empty? q) #t
+          (let loop ()
+            (define rr (queue-remove-front! q))
+            (and
+             (or (andmap (lambda (vb)  (<= (vbody-id (vbox-body vb)) id)))
+                 (equal? (restartable-method-record-return rr) (call-with-values (restartable-method-record-proc rr) list))) ;; todo - need to signal this is restart mode
+           (or (queue-empty? q) (loop)))))
+    (set-transaction-stack-state! t old-state))))
+    
+#|
+;; Note that this does not abort the transaction since the dynamic-wind in with-transaction will do so
+;; (transaction-rollback values ...) aborts the innermost transaction and replace its (with-transaction ...) extent with values
+;;   DANGER: WATCH YOUR ARITIES
+(define (transaction-rollback . abort-values)
+  (define t (thread-cell-ref current-transaction))
+  (unless t
+    (raise-not-in-transaction-error 'transaction-rollback "rollback not permitted when not in transaction"))
+  (apply transaction-abort-continuation abort-values))
+|#
+
+(define-syntax-parameter transaction-rollback
+  (lambda (stx)
+    (raise-syntax-error #f "use of transaction-rollback not in transaction body" stx)))
+
+(define (transaction-abort)
+  (define t (thread-cell-ref current-transaction))
+  (unless (and t (positive? (transaction-stack-count t)))
+    (raise-not-in-transaction-error 'transaction-abort "abort not permitted when not in transaction"))
+  (set-transaction-stack-count! t (sub1 (transaction-stack-count t)))
+  (queue-clear! (vector-ref (transaction-stack-queues t) (transaction-stack-count t)))
+  (when (zero? (transaction-stack-count t))
+    (semaphore-post transaction-complete-semaphore))) ; signal that top level transaction is finished
+
+
+(define (defer . proc+args)
+  (define t (thread-cell-ref current-transaction))
+  (cond [(and t (positive? (transaction-stack-count t)))
+         (queue-add-back! (vector-ref (transaction-stack-queues t) (sub1 (transaction-stack-count t)))
+                          proc+args)]
+        [else (apply (car proc+args)
+                     (cdr proc+args))]))
+
+
+(define (in-transaction?)
+  (define t (thread-cell-ref current-transaction))
+  (and t (positive? (transaction-stack-count t))))
+
+(define (transaction-commit)
+  (let ([t (thread-cell-ref current-transaction)])
+    (unless (and t (positive? (transaction-stack-count t)))
+      (raise-not-in-transaction-error 'transaction-commit "commit not permitted when when not in transaction"))
+    (let* ([c (sub1 (transaction-stack-count t))]
+          [mode (vector-ref (transaction-stack-modes t) c)])
+      (set-transaction-stack-count! t c)
+
+      ;(eprintf "commit transaction in mode ~a\n" mode)
+      (cond [(positive? c)
+             (when (or (eq? mode 'read/write)
+                       (eq? mode 'write))
+               (hash-for-each (vector-ref (transaction-stack-write-tables t) c)
+                              (lambda (vb v)
+                                (hash-set! (vector-ref (transaction-stack-write-tables t) (sub1 c)) vb v))))
+             (queue-copy-clear! (vector-ref (transaction-stack-queues t) (sub1 c))
+                                (vector-ref (transaction-stack-queues t) c))
+             #t]
+            ;; TODO read:restart
+            [else
+             (let ([rs? (eq? mode 'write)]; (or (eq? mode 'write) (set-empty? (transaction-stack-read-set t)))]
+                   [wt (vector-ref (transaction-stack-write-tables t) 0)]
+                   [wt? (or (eq? mode 'read) (eq? mode 'read:restart) #|(hash-empty? wt)|#)])
+               (start-atomic)
+               (set-transaction-stack-state! t 'commit)
+               (when (eq? mode 'read:restart)
+                 (set-transaction-stack-in-restartable?! t #f))
+               (define valid-transaction?
+                 (or rs?
+                     wt?
+                     (and (transaction-consistent? t)
+                          (transaction-restartables-consistent? t))))
+               (when valid-transaction?
+                 (let ([new-id (add1 completed-write-transactions)])
+                   (when (and (or (eq? mode 'read/write) (eq? mode 'write)) (not wt?))
+                     (set! completed-write-transactions new-id)
+                     (set-transaction-record-writes! (transaction-stack-record t) (hash-copy wt))
+                     (hash-for-each wt
+                                    (lambda (vb v)
+                                      (set-vbox-body! vb
+                                                      (vbody new-id v (vbox-body vb))))))))
+               (end-atomic)
+               (semaphore-post (transaction-stack-semaphore t))
+               (when (and valid-transaction? (not (queue-empty? (vector-ref (transaction-stack-queues t) 0))))
+                 (for ([event (in-queue (vector-ref (transaction-stack-queues t) 0))])
+                   (apply (car event) (cdr event)))
+                 (queue-clear! (vector-ref (transaction-stack-queues t) 0)))
+               (set-transaction-stack-state! t 'none)
+               valid-transaction?)]))))
+                       
+
+(define-syntax (with-transaction stx)
+  (syntax-parse stx 
+    [(with-transaction (~optional (~seq #:mode mode:expr)) body ...)
+     (with-syntax ([mode/stx (or (attribute mode) #'read/write)])
+       (syntax/loc stx
+         (let ([thunk (lambda () body ...)]
+               [m 'mode/stx])
+           (cond [(in-transaction?)
+                  (define results #f)
+                  (transaction-begin m #f #f)
+                  (dynamic-wind
+                   void
+                   (lambda ()
+                     (call-with-continuation-barrier
+                      (lambda ()
+                        (set! results (call-with-values thunk list)))))
+                   (lambda ()
+                     (unless results
+                       (transaction-abort))))
+                  (when results (transaction-commit) (apply values results))]
+                 [else
+                  (define results #f)
+                  (let/ec abort-ec
+                    (let loop ()
+                      (let/ec restart-ec
+                        (transaction-begin m abort-ec restart-ec)
+                        (dynamic-wind
+                         void
+                         (lambda ()
+                           (call-with-continuation-barrier
+                            (lambda ()
+                              (set! results (call-with-values thunk list)))))
+                         (lambda ()
+                           (unless results
+                             (transaction-abort)))))  ; exception or call to abort, roll back transaction as it did not complete
+                      (if (and results (transaction-commit)); if results is #f, dynamic-wind aborted already
+                          (apply values results) ; commit successful, return values
+                          (loop))))]))))])) ; commit failed or early restart called, repeat
+
+#|
+(define-syntax (with-transaction stx)
+  (syntax-case stx ()
+    [(_ body ...)
+     #'(let/ec abort-ec
+         (let loop ()
+             (with-handlers ([(lambda (e) #t)
+                              (lambda (e)
+                                (transaction-abort)
+                                (raise e))])
+               (transaction-begin abort-ec)
+               (begin0
+                   (begin body ...)
+                 (unless (transaction-commit)
+                   (loop))))))]))
+|#
+;(provide vbox-history-count)
+;(define (vbox-history-count vb)
+;  (let loop ([body (vbox-body vb)]
+;             [count 1])
+;    (if (vbody-next body)
+;        (loop (vbody-next body) (add1 count))
+;        count)))
+
+;; requires: there exist no active transactions older than id
+;; effects: all history older than id is removed from vb (and therefore unreachable, so the gc can do its thing)
+
+(define (vbox-prune! vb id)
+  (let loop ([body (vbox-body vb)])
+    (if (and (vbody-next body)
+             (>= (vbody-id (vbody-next body)) id))
+        (loop (vbody-next body))
+        (set-vbody-next! body #f))))
+
+
+;; (transaction-cleanup! boxes id) deletes all history from boxes that is older than id
+;; transaction-cleanup! (Setof VBox) Nat -> Void
+;; requires: no running transaction have id < id (i.e. history that is < id will never be reached by vbox-ref, so it's safe to delete)
+
+(define (transaction-cleanup! boxes id)
+  (for ([vb (in-set boxes)])
+    (vbox-prune! vb id))) ; never prunes the head, and never prunes history that's still active, so this is thread safe!
+
+
+(define (transaction<=? t1 t2)
+  (<= (transaction-record-id t1)
+      (transaction-record-id t2)))
+
+(define transaction-heap (make-bin-heap transaction<=?))
+(define transaction-semaphore (make-semaphore 0)) ; if there's a fresh transaction on top of the heap
+(define transaction-complete-semaphore (make-semaphore 0)) ; to signal a finished transaction
+
+(define (add-transaction t)
+  (define result (transaction-record (transaction-stack-id t)
+                                     #f
+                                     (transaction-stack-semaphore t)))
+  (set-transaction-stack-record! t result)    
+  (add-transaction-record result))
+
+
+
+(define (add-transaction-record r)
+  (start-atomic)
+  (define c (bin-heap-count transaction-heap))
+  (bin-heap-add! transaction-heap r)
+  (end-atomic)
+  (when (zero? c) ; because IDs are non-decreasing, new root only if heap was empty
+    (semaphore-post transaction-semaphore)))
+
+(define (transaction-thunk)
+  ; pre: heap is empty
+  (semaphore-wait transaction-semaphore) ; wait until not empty
+  (define written-set (mutable-seteq))
+  (let loop ()  
+    (start-atomic) ; heap not thead safe, all access kept atomic
+    (if (positive? (bin-heap-count transaction-heap))
+        (let ([t (bin-heap-min transaction-heap)])
+          (end-atomic)
+          (when (transaction-record-semaphore t)
+            (unless (semaphore-try-wait? (transaction-record-semaphore t)) ; if the next transaction isn't finished, might as well use the time
+              (transaction-cleanup! written-set (transaction-record-id t)) ; may as well pass the time by cleaning up unused history
+              (set-clear! written-set)
+              (semaphore-wait (transaction-record-semaphore t))))
+          ;(and (transaction-record-semaphore t) (semaphore-wait (transaction-record-semaphore t)))
+          (start-atomic)
+          (bin-heap-remove-min! transaction-heap)
+          (end-atomic)
+          (when (transaction-record-writes t)
+            (for ([vb (in-hash-keys (transaction-record-writes t))])
+              (set-add! written-set vb)))
+          (loop))
+        (end-atomic)))
+  (start-atomic)
+  (let ([id (if (zero? (bin-heap-count transaction-heap)) 
+                completed-write-transactions ; no new transactions since loop ended, erase all history
+                (transaction-record-id (bin-heap-min transaction-heap)))]) ; new transactions since loop ended, erase only history older than
+    ; oldest active transaction
+    (end-atomic)
+    (transaction-cleanup! written-set id)
+    (set-clear! written-set))
+  (transaction-thunk))
+      
+
+;(define history-eraser-thread
+;  (thread transaction-thunk))
