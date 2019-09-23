@@ -2,7 +2,7 @@
 
 (require ffi/unsafe/atomic (for-syntax racket/base syntax/parse) racket/stxparam racket/set racket/list "heap.rkt" "queue.rkt")
 (provide exn:fail:transaction? exn:fail:transaction:not-in-transaction? completed-write-transactions)
-(provide make-vbox vbox-ref vbox-set! vbox-cas! transaction-rollback with-transaction call-with-transaction)
+(provide make-vbox vbox-ref vbox-set! vbox-cas! transaction-rollback with-transaction call-with-transaction transaction-mode?)
 
 ;(define atomic-semaphore (make-semaphore 1))
 ;(define (start-atomic) (semaphore-wait atomic-semaphore))
@@ -57,6 +57,10 @@
 
 ;; this is the timestamp
 (define completed-write-transactions 0)
+
+
+(define (transaction-mode? v)
+  (and (memq v '(read write read/write read:restart)) #t))
 
 ;; whether it's allowed to start child transaction nested in parent transaction.
 ;; (basically, you shouldn't be starting a read-only within a write-only and vise versa
@@ -426,8 +430,8 @@
                (semaphore-post (transaction-stack-semaphore t))
                (when (and valid-transaction? (not (queue-empty? (vector-ref (transaction-stack-queues t) 0))))
                  (for ([event (in-queue (vector-ref (transaction-stack-queues t) 0))])
-                   (apply (car event) (cdr event)))
-                 (queue-clear! (vector-ref (transaction-stack-queues t) 0)))
+                   (apply (car event) (cdr event))))
+               (queue-clear! (vector-ref (transaction-stack-queues t) 0))
                (set-transaction-stack-state! t 'none)
                valid-transaction?)]))))
                        
@@ -589,3 +593,49 @@
 
 (define history-eraser-thread
   (thread transaction-thunk))
+
+
+
+(module+ test
+  (require rackunit)
+
+
+  (define counter (make-vbox 0))
+
+  (define thread1
+    (thread (lambda ()
+              (thread-receive)
+              (with-transaction
+                  (vbox-set! counter (add1 (vbox-ref counter)))))))
+  
+
+  (define thread2
+    (thread (lambda ()
+              (with-transaction
+                  (vbox-set! counter (add1 (vbox-ref counter)))
+                (thread-receive)
+                (defer (lambda (v)
+                         (displayln "FINALIZED")
+                         (unless (= 2 v)
+                           (error 'deferred-action "finalizer called even through transaction was rolled back!")))
+                  (vbox-ref counter))))))
+
+  (thread-send thread1 'go) ; thread 1 will complete and change counter
+  (sleep 1/10)
+
+  (check-eqv? (vbox-ref counter) 1)
+  (check-eq? (thread-running? thread1) #f)
+
+  (thread-send thread2 'go) ; thread 2 should fail and restart
+  (sleep 1/10)
+
+  (check-eqv? (vbox-ref counter) 1)
+  
+  
+  (thread-send thread2 'go-again) ; thread 2 should succeed this time
+  (sleep 1/10)
+
+  (check-eqv? (vbox-ref counter) 2)
+  (check-eq? (thread-running? thread2) #f)
+  
+)
