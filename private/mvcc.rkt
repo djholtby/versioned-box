@@ -47,7 +47,6 @@
 
 
 (define current-transaction (make-thread-cell #f))
-;(define transaction-state-cell (make-thread-cell 'none))
 
 ;; TransactionState is one of 'none 'transaction 'commit 'restart
 ;; none - no active transaction
@@ -55,39 +54,60 @@
 ;; commit - in the process of committing a transaction (this will occur during the execution of any defered procedure calls)
 ;; restart - in atomic mode to retry a restartable method
 
+
+;; this is the timestamp
 (define completed-write-transactions 0)
 
-#|(define interesting-boxes (make-hasheq))
-
-(provide add-interesting-box)
-(define (add-interesting-box vb name)
-  (hash-set! interesting-boxes vb name))
-|#
+;; whether it's allowed to start child transaction nested in parent transaction.
+;; (basically, you shouldn't be starting a read-only within a write-only and vise versa
+;; compastible-modes?: TMode TMode -> Bool
 
 (define (compatible-modes? parent child)
   (or (eq? parent 'read/write)
       (eq? child parent)
       (and (eq? parent 'read) (eq? child 'read:restart))))
 
-
+;; what the top-level transaction mode is for transaction stack t
 (define (transaction-stack-mode t)
   (vector-ref (transaction-stack-modes t) 0))
 
+;; the set of vboxes that have been read by the currently active restartable method
+;;   (or the most recently finished one, but you shouldn't be accessing this outside the context of an active method)
+
 (define (restartable-read-set t)
   (restartable-method-record-read-set (queue-peek-back (transaction-stack-restartable-queue t))))
+
+;; Picks the appropriate set for adding / checking which vboxes have been read by the current transaction / method
 
 (define (transaction-reads t)
   (if (transaction-stack-in-restartable? t)
       (restartable-read-set t)
       (transaction-stack-read-set t)))
 
+;; set up the thread-specific transaction data structures
+
 (define (init-transaction-data)
   (thread-cell-set! current-transaction
-                    (transaction-stack #f 0 initial-size (mutable-seteq) (build-vector initial-size (lambda (i) (make-hasheq))) #f #f
-                                       (make-semaphore 0) (make-vector initial-size #f) #f 
-                                       (build-vector initial-size (lambda (i) (make-queue))) #f (make-queue) 'none #f)))
+                    (transaction-stack 0 ; timestamp when top level transaction was opened
+                                       0 ; how many nested transactions are open
+                                       initial-size ; length of vectors
+                                       (mutable-seteq) ; read-set
+                                       (build-vector initial-size (lambda (i) (make-hasheq))) ; write-table stack
+                                       (make-vector initial-size #f) ; abort continuation stack
+                                       #f ; restart continuation
+                                       (make-semaphore 0) ; semaphore (signal to let GC know it can reap unreachable histories)
+                                       (make-vector initial-size #f) ; mode stack
+                                       #f  ; transaction record
+                                       (build-vector initial-size (lambda (i) (make-queue))) ; deferred thunk queues
+                                       #f ; currently nested within a restartable method?
+                                       (make-queue) ; restartable method queue
+                                       'none ; state
+                                       #f    ; tag
+                                       )))
 
 (provide set-transaction-tag!)
+
+;; sets the nametag for the current thread (useful for debugging transaction issues)
 
 (define (set-transaction-tag! t)
   (unless (thread-cell-ref current-transaction)
@@ -100,6 +120,8 @@
 
 ;; modes: read write read/write read:restart
 
+;; transaction-begin: TMode Continuation Continuation (-> Any ...) -> Transaction
+
 (define (transaction-begin mode abort-thunk restart-thunk [restartable-method-thunk #f])
   (unless (thread-cell-ref current-transaction)
     (init-transaction-data))
@@ -108,7 +130,8 @@
     (let ([ns (arithmetic-shift (transaction-stack-length t) 1)]
           [old-tables (transaction-stack-write-tables t)]
           [old-queues (transaction-stack-queues t)]
-          [old-modes (transaction-stack-modes t)])
+          [old-modes (transaction-stack-modes t)]
+          [old-aborts (transaction-stack-abort t)])
       (set-transaction-stack-length! t ns)
       (set-transaction-stack-write-tables! t (build-vector ns #f))
       (vector-copy! (transaction-stack-write-tables t) 0 old-tables)
@@ -116,6 +139,8 @@
       (vector-copy! (transaction-stack-queues t) 0 old-queues)
       (set-transaction-stack-modes! t (build-vector ns #f))
       (vector-copy! (transaction-stack-modes t) 0 old-modes)
+      (set-transaction-stack-abort! t (build-vector ns #f))
+      (vector-copy! (transaction-stack-abort t) 0 old-aborts)
       (for ([i (in-range (vector-length old-tables) ns)])
         (vector-set! (transaction-stack-write-tables t) i (make-hasheq))
         (vector-set! (transaction-stack-queues t) i (make-queue)))))
@@ -124,13 +149,12 @@
                                           (transaction-stack-in-restartable? t)))
     (set! mode 'read)) ; top level restartables become regular reads, nested restartables also become regular reads
   (vector-set! (transaction-stack-modes t) (transaction-stack-count t) mode)
-
+  (vector-set! (transaction-stack-abort t) (transaction-stack-count t) abort-thunk)
   (start-atomic)
   (cond [(zero? (transaction-stack-count t)) ; top level transaction
          ;; at the top level a restartable transaction is the same as a regular read-only transaction, no special case
          (set-transaction-stack-state! t 'transaction)
          (set-transaction-stack-id! t completed-write-transactions)
-         (set-transaction-stack-abort! t abort-thunk) ;; in the future, the abort continuation will be used for something cool
          (set-transaction-stack-restart! t restart-thunk)
          (when (eq? mode 'read/write) (set-clear! (transaction-stack-read-set t)))
          (unless (or (eq? mode 'read) (eq? mode 'read:restart)) ; read doesn't need write tables, but any write mode does
@@ -159,6 +183,13 @@
          (transaction-restart)])
   (set-transaction-stack-count! t (add1 (transaction-stack-count t)))
   t)
+
+;; (transaction-restart) restarts the current top-level transaction in read/write mode.
+;;   This is triggered by
+;;     - trying to start a nested transaction in a conflicting mode (nothing conflicts with r/w, so problem fixed!)
+;;     - reading from a stale vbox when the written-set is non-empty (transaction will fail to commit and restart anyway, don't waste time)
+;;     - writing to a vbox when a stale read has occurred (ditto)
+;;   This is NOT triggered by a failure to commit.  (See call-with-transaction)
 
 (define (transaction-restart)
   (define t (thread-cell-ref current-transaction))
@@ -220,6 +251,7 @@
 
 ;; (vbox-set! vb v) sets versioned-box vb to value v within the current transaction
 ;;   if no current transaction, immediately commits a write-only transaction that writes v to vb
+;; vbox-set!: (VBoxof X) X -> Void
 
 (define (vbox-set! vb v)
   (define t (thread-cell-ref current-transaction))
@@ -244,6 +276,11 @@
      (add-transaction-record r)
      (end-atomic)]))
 
+;; (vbox-cas! vb proc) updates vb's contents by applying update procedure proc
+;;   this change is done atomically even if done outside of a transaction
+;;     this is substantially lighter weight than a full transaction so this is the
+;;     preferred way to perform any updates that change only a single vbox
+;; vbox-cas!: (VBoxof X) (X -> X) -> Void
 
 (define (vbox-cas! vb proc)
   (define t (thread-cell-ref current-transaction))
@@ -273,12 +310,17 @@
                   (loop)]))])) ; commit failed, retry
 
          
+;; (transaction-consistent? t) produces #t if no vboxes read by t have been updated since t was started
+;;  #f otherwise
 
 (define (transaction-consistent? t)
   (define id (transaction-stack-id t))
   (andmap (lambda (vb)
             (<= (vbody-id (vbox-body vb)) id))
           (set->list (transaction-stack-read-set t))))
+
+;; (transaction-restartables-consistent t) produces #t if no vboxes read by any restartable submethods of t
+;;   have been updated since t was started *OR* if those methods, when restarted, still produce the same value
 
 (define (transaction-restartables-consistent? t)
   (let ([q (transaction-stack-restartable-queue t)]
@@ -291,24 +333,26 @@
             (define rr (queue-remove-front! q))
             (and
              (or (andmap (lambda (vb)  (<= (vbody-id (vbox-body vb)) id)))
-                 (equal? (restartable-method-record-return rr) (call-with-values (restartable-method-record-proc rr) list))) ;; todo - need to signal this is restart mode
+                 (equal? (restartable-method-record-return rr)
+                         (call-with-values (restartable-method-record-proc rr) list))) 
            (or (queue-empty? q) (loop)))))
     (set-transaction-stack-state! t old-state))))
     
-#|
+
 ;; Note that this does not abort the transaction since the dynamic-wind in with-transaction will do so
-;; (transaction-rollback values ...) aborts the innermost transaction and replace its (with-transaction ...) extent with values
-;;   DANGER: WATCH YOUR ARITIES
+;; (transaction-rollback values ...) aborts the innermost transaction and replace continuation with abort-values ...
+;;   DANGER WILL ROBINSON: WATCH YOUR ARITIES
+
 (define (transaction-rollback . abort-values)
   (define t (thread-cell-ref current-transaction))
-  (unless t
+  (unless (and t (eq? (transaction-stack-state t) 'transaction))
     (raise-not-in-transaction-error 'transaction-rollback "rollback not permitted when not in transaction"))
-  (apply transaction-abort-continuation abort-values))
-|#
+  (apply (vector-ref (transaction-stack-abort t) (sub1 (transaction-stack-count t))) abort-values))
+  
 
-(define-syntax-parameter transaction-rollback
-  (lambda (stx)
-    (raise-syntax-error #f "use of transaction-rollback not in transaction body" stx)))
+;(define-syntax-parameter transaction-rollback
+;  (lambda (stx)
+;    (raise-syntax-error #f "use of transaction-rollback not in transaction body" stx)))
 
 (define (transaction-abort)
 ;  (eprintf "abort!\n~a" (continuation-mark-set->context (current-continuation-marks)))
@@ -334,7 +378,7 @@
   (define t (thread-cell-ref current-transaction))
   (and t (positive? (transaction-stack-count t))))
 
-(define (transaction-commit)
+(define (transaction-commit result)
   (let ([t (thread-cell-ref current-transaction)])
     (unless (and t (positive? (transaction-stack-count t)))
       (raise-not-in-transaction-error 'transaction-commit "commit not permitted when when not in transaction"))
@@ -351,6 +395,8 @@
                                 (hash-set! (vector-ref (transaction-stack-write-tables t) (sub1 c)) vb v))))
              (queue-copy-clear! (vector-ref (transaction-stack-queues t) (sub1 c))
                                 (vector-ref (transaction-stack-queues t) c))
+             (when (eq? mode 'read:restart)
+               (set-restartable-method-record-return! (queue-peek-back (transaction-stack-restartable-queue t)) result))
              #t]
             ;; TODO read:restart
             [else
@@ -365,7 +411,7 @@
                  (or rs?
                      wt?
                      (and (transaction-consistent? t)
-                          #|(transaction-restartables-consistent? t)|#)))
+                          (transaction-restartables-consistent? t))))
                (unless valid-transaction? (set! restart-count (add1 restart-count)))
                (when valid-transaction?
                  (let ([new-id (add1 completed-write-transactions)])
@@ -396,34 +442,35 @@
 (define (call-with-transaction thunk #:mode [mode 'read/write])
   (cond [(in-transaction?)
          (define results #f)
-         (transaction-begin mode #f #f)
-         (dynamic-wind
-           void
-           (lambda ()
-             (call-with-continuation-barrier
-              (lambda ()
-                (set! results (call-with-values thunk list)))))
-           (lambda ()
-             (unless results
-               (transaction-abort))))
-         (when results
-           (if (transaction-commit) (apply values results) (raise-transaction-error 'with-transaction "impossible has occurred, a nested transaction failed to commit")))]
+         (let/ec abort-ec ;; jumping with abort-ec will abort the transaction, but only the inner one
+           (dynamic-wind
+             (lambda ()
+               (transaction-begin mode abort-ec #f (if (eq? mode 'read:restart) thunk #f)))
+             (lambda ()
+               (call-with-continuation-barrier
+                (lambda ()
+                  (set! results (call-with-values thunk list)))))
+             (lambda ()
+               (unless results
+                 (transaction-abort))))
+           (when results
+             (if (transaction-commit results) (apply values results) (raise-transaction-error 'with-transaction "impossible has occurred, a nested transaction failed to commit"))))]
         [else
          (define results #f)
          (let/ec abort-ec
            (let loop ()
-             (let/ec restart-ec
-               (transaction-begin mode abort-ec restart-ec)
+             (let/ec restart-ec ;; only top level transactions have a restart continuation (nested transaction don't restart, other than restartable methods, a whole different thingy)
                (dynamic-wind
-                 void
+                 (lambda ()
+                   (transaction-begin mode abort-ec restart-ec))
                  (lambda ()
                    (call-with-continuation-barrier
                     (lambda ()
                       (set! results (call-with-values thunk list)))))
                  (lambda ()
                    (unless results
-                     (transaction-abort)))))  ; exception or call to abort, roll back transaction as it did not complete
-             (if (and results (transaction-commit)); if results is #f, dynamic-wind aborted already
+                     (transaction-abort)))))  ; if thunk escaped with a continuation, abort the transaction (continuation barrier will prevent the sneaky SOB from jumping back in)
+             (if (and results (transaction-commit results)); if results is #f, dynamic-wind aborted already
                  (apply values results) ; commit successful, return values
                  (loop))))])) ; commit failed or early restart called, repeat
 
