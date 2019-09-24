@@ -1,6 +1,6 @@
 #lang racket/base
 
-(require versioned-box racket/unsafe/ops)
+(require versioned-box racket/unsafe/ops ffi/unsafe/atomic)
 
 (struct vhashtable (table key-list-head key-list-tail count mode))
 (struct vhashset vhashtable ())
@@ -107,7 +107,7 @@
 
 (define (vhashmap-items hm)
   (with-transaction #:mode read
-    (let loop ([node (vhashtable-key-list-tail hm)]
+    (let loop ([node (vbox-ref (vhashtable-key-list-tail hm))]
                [so-far null])
       (if (null? node) so-far
           (loop (vbox-ref (vhashnode-key-prev node))
@@ -115,7 +115,8 @@
                             (vhashmapnode-value node))
                       so-far))))))
 
-
+(define (in-vhash-keys ht)
+  (in-list (vhashtable-keys ht)))
 
 (define (vhashmap-ref hm key [failure-result (lambda () (raise-argument-error 'vhashmap-ref "vhashmap-hash-key?" key))])
   (with-transaction #:mode read:restart
@@ -130,7 +131,53 @@
 
 (define (vhashmap-has-key? hm key)                                
   (vhashtable-has-key? hm key))
+
 (define (vhashtable-has-key? ht key)
   (with-transaction #:mode read:restart
     (let-values ([(node next) (vhashtable-find* ht key)])
       (not (null? node)))))
+
+(module+ test
+  (define my-hash (make-vhashmap 'eqv))
+;(add-interesting-box (vhashtable-key-list-tail my-hash) 'tail)
+  (define starter-gun (make-semaphore 0))
+  (define thread-counter (make-thread-cell 0))
+  (define continue? #t)
+  (define thread-pool
+    (build-list 25 (lambda (i)
+                      (thread (lambda ()
+                                (set-transaction-tag! (string->symbol (format "thread-~a" i)))
+                                (semaphore-wait starter-gun)
+                                (let loop ()
+                                  (vhashmap-set! my-hash (random 1024) (format "thread ~a" i))
+                                  ;                                 (thread-cell-set! thread-counter (add1 (thread-cell-ref thread-counter)))
+;                                  (sleep 1/100000000000000000)
+                                  ;                                  (when (< (thread-cell-ref thread-counter) 3000)
+                                  (when continue? (loop))))))))
+  (for ([i (in-range 25)])
+    (semaphore-post starter-gun))
+  
+  (for ([i (in-range 10)])
+    (sleep 1)
+    (print-transaction-debug-info)
+    ;    (displayln restart-count)
+    (displayln (vhashmap-ref my-hash 0 #f)))
+  (start-atomic)
+  (set! continue? #f)
+  (end-atomic)
+  (for-each thread-wait thread-pool)
+  (displayln (format "final restart count: ~a" restart-count))
+  ;  )
+    
+
+
+;  (for ([k (in-list my-keys)])
+;    (unless (= k (vhashmap-ref my-hash k))
+;      (error 'vhashmap-ref "lookup mismatch ~a" k)))
+
+;  (for ([k (in-list my-keys)])
+;    (when (zero? (remainder k 5))
+;      (vhashmap-remove! my-hash k)))
+  
+  (displayln (vhashmap-items my-hash))
+)
