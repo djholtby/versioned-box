@@ -197,9 +197,9 @@
 
 (define (transaction-restart)
   (define t (thread-cell-ref current-transaction))
+  ;(eprintf "restart triggered\n")
   ;; restarts happen because: read-only or write-only hint was wrong, or a stale read occurred during read/write
   ;; therefore: mode is always read/write after a mid-transaction restart
-  (vector-set! (transaction-stack-modes t) 0 'read/write) ; TODO: what about restartable methods?
   ;; escape continuation with indication of incomplete transaction (do not attempt to commit, roll back and restart in read/write mode)
   ((transaction-stack-restart t) 'incomplete))
 
@@ -226,6 +226,8 @@
       [(commit)
        (raise-transaction-error 'vbox-ref "illegal vbox access during defered procedure call")]
       [(transaction)
+       (when (eq? (transaction-stack-mode t) 'write)
+         (transaction-restart))
        (define body
          ;; Walk backward in transactions looking for a write to vb
          ;; if none found, use vb's global history
@@ -266,6 +268,8 @@
     [(and t (eq? (transaction-stack-state t) 'transaction))
      (when (transaction-stack-in-restartable? t)
        (raise-transaction-error 'vbox-set! "write access attempted in read-only method transaction"))
+     (when (memq (transaction-stack-mode t) '(read read:restart))
+       (transaction-restart))
      (hash-set! (vector-ref (transaction-stack-write-tables t)
                             (sub1 (transaction-stack-count t)))
                 vb v)]
@@ -294,6 +298,8 @@
         [(and t (eq? (transaction-stack-state t) 'transaction))
          (when (transaction-stack-in-restartable? t)
            (raise-transaction-error 'vbox-cas! "write access attempted in read-only method transaction"))
+         (unless (eq? (transaction-stack-mode t) 'read/write)
+           (transaction-restart))
          (vbox-set! vb (proc (vbox-ref vb)))] ; if in transaction, cas is nothing special, just a read and a write
         [else
          (let loop ()
@@ -336,7 +342,8 @@
           (let loop ()
             (define rr (queue-remove-front! q))
             (and
-             (or (andmap (lambda (vb)  (<= (vbody-id (vbox-body vb)) id)))
+             (or (andmap (lambda (vb)  (<= (vbody-id (vbox-body vb)) id))
+                         (set->list (restartable-method-record-read-set rr)))
                  (equal? (restartable-method-record-return rr)
                          (call-with-values (restartable-method-record-proc rr) list))) 
            (or (queue-empty? q) (loop)))))
@@ -365,6 +372,8 @@
     (raise-not-in-transaction-error 'transaction-abort "abort not permitted when not in transaction"))
   (set-transaction-stack-count! t (sub1 (transaction-stack-count t)))
   (queue-clear! (vector-ref (transaction-stack-queues t) (transaction-stack-count t)))
+  (when (eq? (vector-ref (transaction-stack-modes t) (transaction-stack-count t)) 'read:restart)
+    (set-transaction-stack-in-restartable?! t #f))
   (when (zero? (transaction-stack-count t))
     (semaphore-post transaction-complete-semaphore))) ; signal that top level transaction is finished
 
@@ -400,7 +409,9 @@
              (queue-copy-clear! (vector-ref (transaction-stack-queues t) (sub1 c))
                                 (vector-ref (transaction-stack-queues t) c))
              (when (eq? mode 'read:restart)
-               (set-restartable-method-record-return! (queue-peek-back (transaction-stack-restartable-queue t)) result))
+               (set-restartable-method-record-return! (queue-peek-back (transaction-stack-restartable-queue t)) result)
+               (set-transaction-stack-in-restartable?! t #f))
+             
              #t]
             ;; TODO read:restart
             [else
@@ -412,10 +423,10 @@
                (when (eq? mode 'read:restart)
                  (set-transaction-stack-in-restartable?! t #f))
                (define valid-transaction?
-                 (or rs?
-                     wt?
-                     (and (transaction-consistent? t)
-                          (transaction-restartables-consistent? t))))
+                 (and (or rs?
+                          wt?
+                          (transaction-consistent? t))
+                      (transaction-restartables-consistent? t)))
                (unless valid-transaction? (set! restart-count (add1 restart-count)))
                (when valid-transaction?
                  (let ([new-id (add1 completed-write-transactions)])
@@ -462,7 +473,7 @@
         [else
          (define results #f)
          (let/ec abort-ec
-           (let loop ()
+           (let loop ([mode mode])
              (let/ec restart-ec ;; only top level transactions have a restart continuation (nested transaction don't restart, other than restartable methods, a whole different thingy)
                (dynamic-wind
                  (lambda ()
@@ -476,7 +487,7 @@
                      (transaction-abort)))))  ; if thunk escaped with a continuation, abort the transaction (continuation barrier will prevent the sneaky SOB from jumping back in)
              (if (and results (transaction-commit results)); if results is #f, dynamic-wind aborted already
                  (apply values results) ; commit successful, return values
-                 (loop))))])) ; commit failed or early restart called, repeat
+                 (loop 'read/write))))])) ; commit failed or early restart called, repeat
 
 #|
 (define-syntax (with-transaction stx)
@@ -601,41 +612,100 @@
 
 
   (define counter (make-vbox 0))
-
+  (define t1sema (make-semaphore 0))
   (define thread1
     (thread (lambda ()
               (thread-receive)
               (with-transaction
-                  (vbox-set! counter (add1 (vbox-ref counter)))))))
-  
+                (vbox-set! counter (add1 (vbox-ref counter)))))))
 
+  
+  (define t2sema (make-semaphore 0))
   (define thread2
     (thread (lambda ()
               (with-transaction
-                  (vbox-set! counter (add1 (vbox-ref counter)))
+                (semaphore-post t2sema)
+                (vbox-set! counter (add1 (vbox-ref counter)))
                 (thread-receive)
                 (defer (lambda (v)
-                         (displayln "FINALIZED")
                          (unless (= 2 v)
                            (error 'deferred-action "finalizer called even through transaction was rolled back!")))
                   (vbox-ref counter))))))
 
+  (semaphore-wait t2sema)
   (thread-send thread1 'go) ; thread 1 will complete and change counter
-  (sleep 1/10)
+  (thread-wait thread1)
 
   (check-eqv? (vbox-ref counter) 1)
   (check-eq? (thread-running? thread1) #f)
 
   (thread-send thread2 'go) ; thread 2 should fail and restart
-  (sleep 1/10)
+  (semaphore-wait t2sema)
 
   (check-eqv? (vbox-ref counter) 1)
   
   
   (thread-send thread2 'go-again) ; thread 2 should succeed this time
-  (sleep 1/10)
+  (thread-wait thread2)
 
   (check-eqv? (vbox-ref counter) 2)
   (check-eq? (thread-running? thread2) #f)
+
+  ;; restarts
+  
+  (define my-box (make-vbox 0))
+  (define my-box-counter 0)
+  (with-transaction #:mode read
+    (set! my-box-counter (add1 my-box-counter)) ;; Don't have side effects in a transaction. Nyah!
+    (vbox-set! my-box (add1 (vbox-ref my-box))))
+  (check-eqv? (vbox-ref my-box) 1)
+  (check-eqv? my-box-counter 2) ; the read mode transaction should have restarted in read/write mode
+
+  (with-transaction #:mode write
+    (set! my-box-counter (add1 my-box-counter))
+    (vbox-set! my-box (add1 (vbox-ref my-box))))
+  (check-eqv? (vbox-ref my-box) 2)
+  (check-eqv? my-box-counter 4) ; the write mode transaction should have restarted in read/write mode
+
+  (with-transaction #:mode write
+    (vbox-set! my-box 42))
+  (check-eqv? (vbox-ref my-box) 42)
+
+
+  (define restartable-counter 0)
+  (define outer-counter 0)
+  (set! thread1
+        (thread (lambda ()
+                  (with-transaction
+                    (set! outer-counter (add1 outer-counter))
+                    (semaphore-post t1sema)
+                    (thread-receive)
+                    (define x (with-transaction #:mode read:restart
+                                (set! restartable-counter (add1 restartable-counter))
+                                (vbox-ref counter)
+                                (vbox-ref my-box)))
+                    (vbox-set! my-box (add1 x))))))
+
+
+  (set! thread2
+        (thread (lambda ()
+                  (thread-receive)
+                  (with-transaction #:mode write
+                    (vbox-set! counter 0)))))
+
+
+  (semaphore-wait t1sema)
+  ;; at this point - thread1 is stalled during a transaction that r/w my-box, with nested restartable that will read counter + mybox
+  (thread-send thread2 'go) ; thread2 will reset counter to 0, causing the nested restartable to become inconsistent
+  (thread-wait thread2) ; write transaction now comitted
+
+  (thread-send thread1 'go) ; thread1 will continue with transaction.  nested should fail and restart, allowing outer to commit first time
+  (thread-wait thread1)
+  
+  (check-eqv? outer-counter 1) ; outer transaction did not restart
+  (check-eqv? restartable-counter 2) ; inner transaction did restart to confirm equal return value
+  (check-eqv? (vbox-ref my-box) 43) ; outer transaction actually comitted
+  (check-eqv? (vbox-ref counter) 0) ; write transaction actually comitted
+  
   
 )
