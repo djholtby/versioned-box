@@ -12,6 +12,9 @@
 versioned-box is a library that provides Software Transactional Memory (STM) by way of Multi-Versioned Concurrency Control (MVCC).
 The ideas are based largely on @hyperlink[paper-url]{@italic{Versioned Boxes as the Basis for Memory Transactions}}, though currently not all features are implemented.
 
+@defproc[(transaction-mode? [v any/c]) boolean?]{Produces @racket[#t] if v is a valid transaction mode (@racket['read] for read-only, @racket['write] for write-only, @racket['read/write] for the default read/write mode,
+                                                                                                 and @racket['read:restart] for a restartable read-only method).}
+
 @defproc[(make-vbox [value any/c])
          vbox?]{Returns a new versioned box that contains @racket[value]}
 
@@ -27,30 +30,58 @@ The ideas are based largely on @hyperlink[paper-url]{@italic{Versioned Boxes as 
 
 @defproc[(vbox-cas! [vb vbox?]
                     [update (-> any/c any/c)])
-         void?]{If called outside a transaction, applies @racket[update] to @racket[vb]'s value and then updates @racket[vb] to be the value returned by @racket[update].  If @racket[vb] has been updated since the initial read, the process repeats until a consistent write can be achieved.  (For this reason it is important to avoid all side effects within the update proc, or they may be repeated).
+         void?]{If called within a transaction, is equivalent to @racket[(vbox-set! (update (vbox-ref vb)))]
 
-                   If called within a transaction, is equivalent to @racket[(vbox-set! (update (vbox-ref vb)))]}
+ If called outside a transaction, is mostly equivalent to the above within a read/write transaction, but much more efficient,
+ because there is only one value in the read and write sets, and the the simplified logical flow.  
+
+ Note that update should not have side effects, since it may potentially be called more than once before the transaction is committed.
+However, because of the simplified structure, @racket[defer] cannot be used to defer side effects until commit time.  
+ 
+                   }
                   
+@defproc[(call-with-transaction [thunk (-> X)]
+                                [#:mode mode [transaction-mode? 'read/write]])
+         X]{Evaluates thunk within the context of transaction.  All vbox reads return the value those boxes had immediately before thunk was
+ first called, and vbox writes are made to temporary storage until the transactoin is committed.
 
+ When the thunk returns, the transaction is checked for consistenecy and committed.
+ If the transaction is not consistent (it is a read/write transaction, and one or more of the reads was invalidated while thunk
+ was running) then the transaction is rolled back and thunk is repeated until it can be committed successfully.
+ 
+ Because thunk can potentially be repeated many times, all side effects should be avoided, or placed in a finalizer (see @racket[defer])
+ 
+ Any continuation jumps out of thunk result in rolling back the transaction, and in this case the transaction is fully aborted
+ (it will not be repeated).  A continuation barrier (TODO MAKE A COOL LINK) prevents jumps back into thunk.
+ 
+ If mode is set to read, or write, then less bookkeeping is required and the transaction will be more efficient.
+ read and write are considered to be hints only.  If a write occurs during a read-only transaction,
+ or a read occurs during a write-only transaction, the transaction will
+ be restarted in read/write mode (it needs to be restarted as necessary bookkeeping was not being done).
+ 
+ There is an additional mode, read:restart, intended to be for restartable methods.  When a restartable method is started
+ in a nested context, it keeps track of its read seperately, and also keeps track of its final return value(s).
+ 
+ If the top-level transaction is consistent other than the reads from a restartable method, then that restartable method is run again
+ in atomic mode, and the conflict is ignored if this repeat call produces the same value (as far as @racket[equal?] is concerned).
+
+ TODO: option to have restartable methods specify their match predicate?
+             
+}
 
 @defform*[
           ((with-transaction  expr ...)
            (with-transaction #:mode mode-hint))
          #:grammar
-         [(mode-hint (any/c 'read 'write 'read/write 'read:restart))]
-         ]{Evaluates the exprs in order, and ignores the results of all but the last expr.
-                                all access to vbox values are recorded in a transaction.  When the last expr has been evaluated, the transaction is either committed (if no vbox contents have been updated since the transaction began) or rolled back, in which case the transaction repeats.
-                                
-                                If a continuation breaks out of the with-transaction syntax, the current transaction is automatically rolled back (and in this case, will not be restarted).
+         [(mode-hint transaction-mode?)]
+         ]{
+            Syntax equivalent to @racket[(call-with-transaction (lambda () expr ...) #:mode mode-hint)].  
+          }
 
-                                Optionally, a mode hint can be provided.  Transactions that do not write to any vboxes can be run in 'read mode, which is more efficient as it does not need
-                                to keep track of vbox access (which requires two hash tables).  Transactions that do not read from any vboxes can be run in 'write mode, which is also more efficient
-                                for the same reason.  Attempts to write during 'read mode or read during 'write mode result in the transaction failing and being restarted in 'read/write mode.
+@defproc[(defer [proc (-> X ... any/c)]
+                [arg X] ...) void?]{
+                                    Defers a call to thunk with the given arguments until the current top-level transaction has been comitted.
+                                    (proc is called outside of the transaction so it must not read from or write to vboxes).
 
-                                If no hint is provided then the default assumption is a 'read/write transaction.
-
-                                Versioned boxes also support 'read:restart mode.  These special read-only transactions record the value they returned.
-                                If the parent transaction is inconsistent only because of the boxes read 'read:restart transaction, then the 'read:restar transaction is run again, and
-                                if the return value is unchanged, the parent transaction is considered consistent anyway.  The restarted transaction is executed in atomic mode, so this should be
-                                reserved for relatively fast transactions only.
-                                }
+                                    Called outside of a transaction, immediately applies proc to the supplied arguments.
+                                    }
