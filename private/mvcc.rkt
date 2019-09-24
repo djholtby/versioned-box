@@ -706,6 +706,36 @@
   (check-eqv? restartable-counter 2) ; inner transaction did restart to confirm equal return value
   (check-eqv? (vbox-ref my-box) 43) ; outer transaction actually comitted
   (check-eqv? (vbox-ref counter) 0) ; write transaction actually comitted
+
+  ;; Tests to ensure that rolling back a nested transaction is successful and does not roll back the outer transaction
   
+  (define roll-result #f)
+  (with-transaction
+    (define x (vbox-ref counter))
+    (define y (with-transaction 
+                (vbox-set! my-box (add1 (vbox-ref my-box)))
+                (transaction-rollback 'roll-back)))
+    (vbox-set! counter (add1 x))
+    (set! roll-result y))
+  (check-eq? roll-result 'roll-back) ; check that rollback correctly returned a value
+  (check-eqv? (vbox-ref counter) 1) ; check that inner transaction was aborted
+  (check-eqv? (vbox-ref my-box) 43) ; check that outer transaction was comitted
+
+
+  ;; Tests to ensure that an exception within a nested transaction aborts the nested transaction, but not the outer transaction
+  
+  (with-transaction
+      (define x (vbox-ref counter))
+    (with-handlers ([exn? (λ (e) (set! roll-result 'exception-caught))])
+      (with-transaction
+          (vbox-set! my-box #f)
+          (/ (vbox-ref counter) 0)))
+    (check-true (in-transaction?)) ; check that we got here, but are still in a transaction
+    (vbox-set! counter (add1 x)))
+
+  (check-false (in-transaction?)) ; check that we're now out of the top level transaction
+  (check-eq? roll-result 'exception-caught) ; check that the exception was caught (it didn't jump all the way out)
+  (check-eqv? (vbox-ref my-box) 43) ; check that inner transaction was rolled back by the exception
+  (check-eqv? (vbox-ref counter) 2) ; check that the outer transaction was comitted
   
 )
