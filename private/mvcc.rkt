@@ -703,7 +703,7 @@
                 (thread-receive)
                 (defer (lambda (v)
                          (unless (= 2 v)
-                           (error 'deferred-action "finalizer called even through transaction was rolled back!")))
+                           (error 'deferred-action "defered action called even through transaction was rolled back!")))
                   (vbox-ref counter))))))
 
   (semaphore-wait t2sema)
