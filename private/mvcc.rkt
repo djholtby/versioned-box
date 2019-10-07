@@ -115,7 +115,7 @@
                                        (make-vector initial-size #f) ; mode stack
                                        #f  ; transaction record
                                        (build-vector initial-size (lambda (i) (make-queue))) ; deferred thunk queues
-                                       (build-vector initial-size (lambda (i) (mutable-seteq))) ; deferred atomic thunk queues
+                                       (build-vector initial-size (lambda (i) (make-queue))) ; finalizer queue
                                        #f ; currently nested within a restartable method?
                                        (make-queue) ; restartable method queue
                                        'none ; state
@@ -167,7 +167,7 @@
       (for ([i (in-range (vector-length old-tables) ns)])
         (vector-set! (transaction-stack-write-tables t) i (make-hasheq))
         (vector-set! (transaction-stack-t-tables t) i (make-hasheq))
-        (vector-set! (transaction-stack-finalizers t) i (mutable-seteq))
+        (vector-set! (transaction-stack-finalizers t) i (make-queue))
         (vector-set! (transaction-stack-queues t) i (make-queue)))))
   (define outer-mode (transaction-stack-mode t))
   (when (and (eq? mode 'read:restart) (or (zero? (transaction-stack-count t))
@@ -175,6 +175,7 @@
     (set! mode 'read)) ; top level restartables become regular reads, nested restartables also become regular reads
   (vector-set! (transaction-stack-modes t) (transaction-stack-count t) mode)
   (vector-set! (transaction-stack-abort t) (transaction-stack-count t) abort-thunk)
+  (hash-clear! (vector-ref (transaction-stack-t-tables t) (transaction-stack-count t)))
   (start-atomic)
   (cond [(zero? (transaction-stack-count t)) ; top level transaction
          ;; at the top level a restartable transaction is the same as a regular read-only transaction, no special case
@@ -184,11 +185,9 @@
          (when (eq? mode 'read/write) (set-clear! (transaction-stack-read-set t)))
          (unless (or (eq? mode 'read) (eq? mode 'read:restart)) ; read doesn't need write tables, but any write mode does
            (hash-clear! (vector-ref (transaction-stack-write-tables t) 0)))
-         (hash-clear! (vector-ref (transaction-stack-t-tables t) 0))
          (queue-clear! (transaction-stack-restartable-queue t))
          (add-transaction t)
          (end-atomic)
-         ; (struct restartable-method-record (read-set [return #:mutable] proc))
          ]
         [(and restartable-method-thunk (not (transaction-stack-in-restartable? t)))
          (end-atomic)
@@ -199,7 +198,7 @@
          (end-atomic)
          (unless (eq? outer-mode 'read) ; read doesn't need write tables, but any write mode does
            (hash-clear! (vector-ref (transaction-stack-write-tables t) (transaction-stack-count t))))]
-        (hash-clear! (vector-ref (transaction-stack-t-tables t) (transaction-stack-count t)))
+        
         [(and (or (eq? mode 'read/write)
                   (eq? mode 'write))
               (transaction-stack-in-restartable? t))
@@ -286,7 +285,7 @@
 (define (vbox-set! vb v)
   (let ([t (thread-cell-ref current-transaction)])
     (case (transaction-state t)
-      [(commit restart)
+      [(commit commit/atomic restart)
        (raise-transaction-error 'vbox-set! "illegal vbox access during defered procedure call")]
       [(transaction)
        (when (transaction-stack-in-restartable? t)
@@ -297,10 +296,11 @@
                               (sub1 (transaction-stack-count t)))
                   vb v)]
       [(finalize)
-       (let ([r (transaction-stack-record t)])
-         (when (transaction-record-writes r)
-           (set-vbox-body! vb (vbody completed-write-transactions v (vbox-body vb)))
-           (hash-set! (transaction-record-writes r) vb v)))]
+       (hash-set! (transaction-record-writes (transaction-stack-record t)) vb v)
+       (set-vbox-body! vb
+                       (if (= completed-write-transactions (vbody-id (vbox-body vb)))
+                               (vbody completed-write-transactions v (vbody-next (vbox-body vb)))
+                               (vbody completed-write-transactions v (vbox-body vb))))]
       [else
        (start-atomic)
        (set! completed-write-transactions (add1 completed-write-transactions))
@@ -352,17 +352,20 @@
 
 (define (tbox-ref tb)
   (let ([t (thread-cell-ref current-transaction)])
-    (cond [(and t (not (eq? 'none (transaction-stack-mode t))))
-           (let loop ([i (transaction-stack-count t)])
-             (if (zero? i)
-                 (tbox-value tb)
-                 (hash-ref (vector-ref (transaction-stack-t-tables t) (sub1 i)) tb (lambda () (loop)))))]
-          [else (raise-not-in-transaction-error 'tbox-ref "Transaction Boxes are undefined outside a transaction")])))
+    (cond [(and t (not (eq? 'none (transaction-stack-state t))))
+
+           (let loop ([i (if (eq? 'finalize (transaction-stack-state t)) 0 (sub1 (transaction-stack-count t)))])
+             (cond [(negative? i)
+                    (tbox-value tb)]
+                   [(hash-has-key? (vector-ref (transaction-stack-t-tables t) i) tb)
+                    (hash-ref (vector-ref (transaction-stack-t-tables t) i) tb)]
+                   [else (loop (sub1 i))]))]
+          [else (tbox-value tb)])))
                  
 (define (tbox-set! tb v)  
   (let ([t (thread-cell-ref current-transaction)])
-    (cond [(and t (not (eq? 'none (transaction-stack-mode t))))
-           (hash-set! (vector-ref (transaction-stack-t-tables t) (sub1 (transaction-stack-count t))) tb v)]
+    (cond [(and t (not (eq? 'none (transaction-stack-state t))))
+           (hash-set! (vector-ref (transaction-stack-t-tables t) (max 0 (sub1 (transaction-stack-count t)))) tb v)]
           [else (raise-not-in-transaction-error 'tbox-set! "Transaction Boxes are undefined outside a transaction")])))
   
 
@@ -418,7 +421,7 @@
     (raise-not-in-transaction-error 'transaction-abort "abort not permitted when not in transaction"))
   (set-transaction-stack-count! t (sub1 (transaction-stack-count t)))
   (queue-clear! (vector-ref (transaction-stack-queues t) (transaction-stack-count t)))
-  (set-clear! (vector-ref (transaction-stack-finalizers t) (transaction-stack-count t)))
+  (queue-clear! (vector-ref (transaction-stack-finalizers t) (transaction-stack-count t)))
   (when (eq? (vector-ref (transaction-stack-modes t) (transaction-stack-count t)) 'read:restart)
     (set-transaction-stack-in-restartable?! t #f))
   (when (zero? (transaction-stack-count t))
@@ -434,9 +437,12 @@
                      (cdr proc+args))]))
 
 (define (finalizer proc)
+  (unless (and (procedure? proc)
+               (procedure-arity-includes? proc 0))
+    (raise-argument-error 'finalizer "procedure that can be applied to 0 arguments" proc))
   (define t (thread-cell-ref current-transaction))
   (cond [(and t (positive? (transaction-stack-count t)))
-         (set-add! (vector-ref (transaction-stack-finalizers t) (sub1 (transaction-stack-count t)))
+         (queue-add-back! (vector-ref (transaction-stack-finalizers t) (sub1 (transaction-stack-count t)))
                    proc)]
         [else (raise-not-in-transaction-error 'finalizer "atomic defers not permitted outside of transaction")]))
 
@@ -466,7 +472,7 @@
                                 (hash-set! dest tb v))))
              (queue-copy-clear! (vector-ref (transaction-stack-queues t) (sub1 c))
                                 (vector-ref (transaction-stack-queues t) c))
-             (set-union! (vector-ref (transaction-stack-finalizers t) (sub1 c))
+             (queue-copy-clear! (vector-ref (transaction-stack-finalizers t) (sub1 c))
                          (vector-ref (transaction-stack-finalizers t) c))
              ;(queue-copy-clear! (vector-ref (transaction-stack-atomic-queues t) (sub1 c))
              ;                  (vector-ref (transaction-stack-atomic-queues t) c))
@@ -499,18 +505,18 @@
                                     (lambda (vb v)
                                       (set-vbox-body! vb
                                                       (vbody new-id v (vbox-body vb))))))))
-                   
-                   
-               (when (and valid-transaction? (not (set-empty? (vector-ref (transaction-stack-finalizers t) 0))))
+               (when (and valid-transaction? (not (queue-empty? (vector-ref (transaction-stack-finalizers t) 0))))
                  (set-transaction-stack-state! t 'finalize)
                  (unless (transaction-record-writes (transaction-stack-record t))
                      (set-transaction-record-writes! (transaction-stack-record t) (make-hasheq)))
-                 (for ([finalizer (in-set (vector-ref (transaction-stack-finalizers t) 0))])
+                 (for ([finalizer (in-queue
+                                   (vector-ref
+                                    (transaction-stack-finalizers t) 0))])
                    (finalizer)))
                (end-atomic)
                (set-transaction-stack-state! t 'commit)
                (semaphore-post (transaction-stack-semaphore t))
-               (set-clear! (vector-ref (transaction-stack-finalizers t) 0))
+               (queue-clear! (vector-ref (transaction-stack-finalizers t) 0))
                (when (and valid-transaction? (not (queue-empty? (vector-ref (transaction-stack-queues t) 0))))
                  (for ([event (in-queue (vector-ref (transaction-stack-queues t) 0))])
                    (apply (car event) (cdr event))))
