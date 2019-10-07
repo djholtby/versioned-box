@@ -1,6 +1,6 @@
 #lang racket/base
 
-(require versioned-box racket/unsafe/ops ffi/unsafe/atomic)
+(require versioned-box racket/unsafe/ops)
 
 (struct vhashtable (table key-list-head key-list-tail count mode))
 (struct vhashset vhashtable ())
@@ -10,7 +10,7 @@
 (struct vhashmapnode vhashnode (value))
 
 
-(define initial-size 128)
+(define initial-size 64)
 (define alpha-factor 2)
 
 
@@ -50,10 +50,26 @@
                     (loop (vbox-ref next) next))])))))
 
 
+(define (vhashtable-grow* hm)
+  (vbox-set! (vhashtable-table hm)
+             (build-vector (* 4 (vector-length (vbox-ref (vhashtable-table hm))))
+                           (lambda (i) (make-vbox null))))
+  (let loop ([node (vbox-ref (vhashtable-key-list-head hm))])
+    (unless (null? node)
+      (let-values ([(dont-care next) (vhashtable-find* hm (vhashnode-key node))])
+        (vbox-set! next node)
+        (vbox-set! (vhashnode-next node) null))
+      (loop (vbox-ref (vhashnode-key-next node))))))
+
+
 (define (vhashmap-set! hm key value)
     (with-transaction
+      (when (>= (vbox-ref (vhashtable-count hm)) (* alpha-factor (vector-length (vbox-ref (vhashtable-table hm)))))
+        (vhashtable-grow* hm))
       (let-values ([(node next) (vhashtable-find* hm key)])
         (cond [(null? node) ;                    
+
+               (vbox-cas! (vhashtable-count hm) add1)
                (let* ([tail-node (vbox-ref (vhashtable-key-list-tail hm))]
                       [new-node  (vhashmapnode key                   
                                                (make-vbox null)      ; next node in chain
@@ -138,6 +154,7 @@
       (not (null? node)))))
 
 (module+ test
+  (require ffi/unsafe/atomic)
   (define my-hash (make-vhashmap 'eqv))
 ;(add-interesting-box (vhashtable-key-list-tail my-hash) 'tail)
   (define starter-gun (make-semaphore 0))
@@ -180,4 +197,17 @@
 ;      (vhashmap-remove! my-hash k)))
   
   (displayln (vhashmap-items my-hash))
+
+  (set! my-hash (make-vhashmap 'eqv))
+  (time
+   (for ([i (in-range 65536)])
+     (vhashmap-set! my-hash i i)))
+  
+  (displayln (vector-length (vbox-ref (vhashtable-table my-hash))))
+
+  (time
+   (for ([i (in-range 65536)])
+     (unless (eqv? i (vhashmap-ref my-hash i #f))
+       (error 'ERROR "hash-ref mismatch ~a" i))))
+  
 )
