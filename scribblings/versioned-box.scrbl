@@ -33,14 +33,14 @@ The ideas are based largely on @hyperlink[paper-url]{@italic{Versioned Boxes as 
          void?]{If called within a transaction, is equivalent to @racket[(vbox-set! (update (vbox-ref vb)))]
 
  If called outside a transaction, is mostly equivalent to the above within a read/write transaction, but much more efficient,
- because there is only one value in the read and write sets, and the the simplified logical flow.  
+ because there is only one value in the read and write sets, and the the simplified logical flow.
 
- Note that update should not have side effects, since it may potentially be called more than once before the transaction is committed.
-However, because of the simplified structure, @racket[defer] cannot be used to defer side effects until commit time.  
+  Note that update should not have side effects, since it may potentially be called more than once before the transaction is committed.
+Unlike with a regular transasction, @racket[defer] cannot be used to defer side effects until commit time.  
  
                    }
                   
-@defproc[(call-with-transaction [thunk (-> X)]
+@defproc[(call-with-mvcc-transaction [thunk (-> X)]
                                 [#:mode mode [transaction-mode? 'read/write]])
          X]{Evaluates thunk within the context of transaction.  All vbox reads return the value those boxes had immediately before thunk was
  first called, and vbox writes are made to temporary storage until the transactoin is committed.
@@ -75,7 +75,7 @@ However, because of the simplified structure, @racket[defer] cannot be used to d
          #:grammar
          [(mode-hint transaction-mode?)]
          ]{
-            Syntax equivalent to @racket[(call-with-transaction (lambda () expr ...) #:mode mode-hint)].  
+            Syntax equivalent to @racket[(call-with-mvcc-transaction (lambda () expr ...) #:mode mode-hint)].  
           }
 
 @defproc[(defer [proc (-> X ... any/c)]
