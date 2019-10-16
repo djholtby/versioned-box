@@ -3,7 +3,7 @@
 (require ffi/unsafe/atomic (for-syntax racket/base syntax/parse) racket/stxparam racket/set racket/list "heap.rkt" "queue.rkt")
 (provide exn:fail:transaction? exn:fail:transaction:not-in-transaction? completed-write-transactions)
 (provide defer finalizer)
-(provide make-vbox vbox-ref vbox-set! vbox-cas! transaction-rollback with-transaction call-with-transaction transaction-mode?)
+(provide make-vbox vbox-ref vbox-set! vbox-cas! transaction-rollback with-transaction call-with-mvcc-transaction transaction-mode? read-vbox)
 (provide tbox tbox-ref tbox-set!)
 ;(define atomic-semaphore (make-semaphore 1))
 ;(define (start-atomic) (semaphore-wait atomic-semaphore))
@@ -20,11 +20,14 @@
   [(define (write-proc vb port mode)
      (define value (vbox-ref vb))
      (case mode
-       [(#t) (display "#*" port) (write value port)]
+       [(#t) (display "#v" port) (write value port)]
        [(#f) (display value port)]
        [else (display "(make-vbox " port)
              (print value port mode)
-             (display ")")]))])
+             (display ")" port)]))])
+
+(define (read-vbox ignore port . args)
+  (make-vbox (read port)))
 
 (struct tbox (value))
 
@@ -215,7 +218,7 @@
 ;;     - trying to start a nested transaction in a conflicting mode (nothing conflicts with r/w, so problem fixed!)
 ;;     - reading from a stale vbox when the written-set is non-empty (transaction will fail to commit and restart anyway, don't waste time)
 ;;     - writing to a vbox when a stale read has occurred (ditto)
-;;   This is NOT triggered by a failure to commit.  (See call-with-transaction)
+;;   This is NOT triggered by a failure to commit.  (See call-with-mvcc-transaction)
 
 (define (transaction-restart)
   (define t (thread-cell-ref current-transaction))
@@ -530,9 +533,9 @@
     [(with-transaction (~optional (~seq #:mode mode:expr)) body ...)
      (with-syntax ([mode/stx (or (attribute mode) #'read/write)])
        (syntax/loc stx
-         (call-with-transaction (lambda () body ...) #:mode 'mode/stx)))]))
+         (call-with-mvcc-transaction (lambda () body ...) #:mode 'mode/stx)))]))
 
-(define (call-with-transaction thunk #:mode [mode 'read/write])
+(define (call-with-mvcc-transaction thunk #:mode [mode 'read/write])
   (cond [(in-transaction?)
          (define results #f)
          (let/ec abort-ec ;; jumping with abort-ec will abort the transaction, but only the inner one
