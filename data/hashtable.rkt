@@ -153,7 +153,7 @@
     (let-values ([(node next) (vhashtable-find* ht key)])
       (not (null? node)))))
 
-(module+ test
+(module+ main
   (require ffi/unsafe/atomic)
   (define my-hash (make-vhashmap 'eqv))
 ;(add-interesting-box (vhashtable-key-list-tail my-hash) 'tail)
@@ -176,7 +176,7 @@
   
   (for ([i (in-range 10)])
     (sleep 1)
-    (print-transaction-debug-info)
+    ;(print-transaction-debug-info)
     ;    (displayln restart-count)
     (displayln (vhashmap-ref my-hash 0 #f)))
   (start-atomic)
