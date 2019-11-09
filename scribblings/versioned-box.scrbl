@@ -1,4 +1,4 @@
-#lang scribble/doc
+#lang scribble/manual
 
 @(require scribble/manual
           (for-label versioned-box))
@@ -80,8 +80,19 @@ Unlike with a regular transasction, @racket[defer] cannot be used to defer side 
 
 @defproc[(defer [proc (-> X ... any/c)]
                 [arg X] ...) void?]{
-                                    Defers a call to thunk with the given arguments until the current top-level transaction has been comitted.
-                                    (proc is called outside of the transaction so it must not read from or write to vboxes).
+                                    Defers a call to @racket[proc] with the given arguments @racket[X ...] until the current top-level transaction has been comitted.
+                                    Defered procs are called in the order that they were defered in, and must not read from or write to vboxes,
+                                    or start a transaction of their own.  
 
-                                    Called outside of a transaction, immediately applies proc to the supplied arguments.
+                                    Called outside of a transaction, immediately applies proc to the supplied arguments.  
                                     }
+
+@defproc[(finalize [proc (-> X ... any/c)]
+                   [art X] ...) void?]{Defers a call to @racket[proc] with the given arguments @racket[X ...] until the current top-level transaction has been comitted.
+                                       Finalize procs are called in atomic mode.  They must not start new tranactions, but are allowed to
+                                       read from and write to vboxes.
+
+                                       Since they are run in atomic mode, they will always be consistent.  A finalizer for a read-only transaction
+                                       IS able to write to vboxes.  
+
+                                       }
