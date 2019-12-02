@@ -3,7 +3,7 @@
 (require ffi/unsafe/atomic (for-syntax racket/base syntax/parse) racket/stxparam racket/set racket/list "heap.rkt" "queue.rkt")
 (provide exn:fail:transaction? exn:fail:transaction:not-in-transaction? completed-write-transactions)
 (provide defer finalizer)
-(provide make-vbox vbox-ref vbox-set! vbox-cas! transaction-rollback with-transaction call-with-mvcc-transaction transaction-mode? read-vbox)
+(provide make-vbox vbox? vbox-ref vbox-set! vbox-cas! transaction-rollback with-transaction call-with-mvcc-transaction transaction-mode? read-vbox)
 (provide tbox tbox-ref tbox-set!)
 ;(define atomic-semaphore (make-semaphore 1))
 ;(define (start-atomic) (semaphore-wait atomic-semaphore))
