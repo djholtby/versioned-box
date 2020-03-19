@@ -3,7 +3,8 @@
 (require ffi/unsafe/atomic (for-syntax racket/base syntax/parse) racket/stxparam racket/set racket/list "heap.rkt" "queue.rkt")
 (provide exn:fail:transaction? exn:fail:transaction:not-in-transaction? completed-write-transactions)
 (provide defer finalizer)
-(provide make-vbox vbox? vbox-ref vbox-set! vbox-cas! transaction-rollback with-transaction call-with-mvcc-transaction transaction-mode? read-vbox)
+(provide make-vbox vbox? vbox-ref vbox-set! vbox-cas! transaction-rollback with-transaction
+         call-with-mvcc-transaction transaction-mode? read-vbox)
 (provide tbox tbox-ref tbox-set!)
 ;(define atomic-semaphore (make-semaphore 1))
 ;(define (start-atomic) (semaphore-wait atomic-semaphore))
@@ -12,8 +13,8 @@
 ;(define start-atomic void)
 ;(define end-atomic void)
 
-(define restart-count 0)
-(provide restart-count)
+;(define restart-count 0)
+;(provide restart-count)
 
 (struct vbox ([body #:mutable])
   #:methods gen:custom-write
@@ -185,9 +186,9 @@
          (set-transaction-stack-state! t 'transaction)
          (set-transaction-stack-id! t completed-write-transactions)
          (set-transaction-stack-restart! t restart-thunk)
-         (when (eq? mode 'read/write) (set-clear! (transaction-stack-read-set t)))
-         (unless (or (eq? mode 'read) (eq? mode 'read:restart)) ; read doesn't need write tables, but any write mode does
-           (hash-clear! (vector-ref (transaction-stack-write-tables t) 0)))
+ ;        (when (eq? mode 'read/write) (set-clear! (transaction-stack-read-set t)))
+;         (unless (or (eq? mode 'read) (eq? mode 'read:restart)) ; read doesn't need write tables, but any write mode does
+;           (hash-clear! (vector-ref (transaction-stack-write-tables t) 0)))
          (queue-clear! (transaction-stack-restartable-queue t))
          (add-transaction t)
          (end-atomic)
@@ -199,9 +200,9 @@
          ]
         [(compatible-modes? outer-mode mode)
          (end-atomic)
-         (unless (eq? outer-mode 'read) ; read doesn't need write tables, but any write mode does
-           (hash-clear! (vector-ref (transaction-stack-write-tables t) (transaction-stack-count t))))]
-        
+         ;(unless (eq? outer-mode 'read) ; read doesn't need write tables, but any write mode does
+         ;  (hash-clear! (vector-ref (transaction-stack-write-tables t) (transaction-stack-count t))))]
+         ]
         [(and (or (eq? mode 'read/write)
                   (eq? mode 'write))
               (transaction-stack-in-restartable? t))
@@ -425,9 +426,14 @@
   (set-transaction-stack-count! t (sub1 (transaction-stack-count t)))
   (queue-clear! (vector-ref (transaction-stack-queues t) (transaction-stack-count t)))
   (queue-clear! (vector-ref (transaction-stack-finalizers t) (transaction-stack-count t)))
+  (hash-clear! (vector-ref (transaction-stack-write-tables t) (transaction-stack-count t)))
+  (hash-clear! (vector-ref (transaction-stack-t-tables t) (transaction-stack-count t)))
+  (vector-set! (transaction-stack-abort t) (transaction-stack-count t) #f)
   (when (eq? (vector-ref (transaction-stack-modes t) (transaction-stack-count t)) 'read:restart)
     (set-transaction-stack-in-restartable?! t #f))
   (when (zero? (transaction-stack-count t))
+    (set-clear! (transaction-stack-read-set t))
+    (set-transaction-stack-restart! t #f)
     (semaphore-post transaction-complete-semaphore))) ; signal that top level transaction is finished
 
 
@@ -460,7 +466,9 @@
     (let* ([c (sub1 (transaction-stack-count t))]
            [mode (vector-ref (transaction-stack-modes t) c)])
       (set-transaction-stack-count! t c)
-
+      (vector-set! (transaction-stack-abort t) c #f)
+      (when (zero? c)
+        (set-transaction-stack-restart! t #f))
       ;(eprintf "commit transaction in mode ~a\n" mode)
       (cond [(positive? c)
              (when (or (eq? mode 'read/write)
@@ -468,11 +476,13 @@
                (let ([dest (vector-ref (transaction-stack-write-tables t) (sub1 c))])
                  (hash-for-each (vector-ref (transaction-stack-write-tables t) c)
                                 (lambda (vb v)
-                                  (hash-set! dest vb v)))))
+                                  (hash-set! dest vb v))))
+               (hash-clear! (vector-ref (transaction-stack-write-tables t) c)))
              (let ([dest (vector-ref (transaction-stack-t-tables t) (sub1 c))])
                (hash-for-each (vector-ref (transaction-stack-t-tables t) c)
                               (lambda (tb v)
-                                (hash-set! dest tb v))))
+                                (hash-set! dest tb v)))
+               (hash-clear! (vector-ref (transaction-stack-t-tables t) c)))
              (queue-copy-clear! (vector-ref (transaction-stack-queues t) (sub1 c))
                                 (vector-ref (transaction-stack-queues t) c))
              (queue-copy-clear! (vector-ref (transaction-stack-finalizers t) (sub1 c))
@@ -498,7 +508,7 @@
                           wt?
                           (transaction-consistent? t))
                       (transaction-restartables-consistent? t)))
-               (unless valid-transaction? (set! restart-count (add1 restart-count)))
+               ;(unless valid-transaction? (set! restart-count (add1 restart-count)))
                (when valid-transaction?
                  (let ([new-id (add1 completed-write-transactions)])
                    (when (and (or (eq? mode 'read/write) (eq? mode 'write)) (not wt?))
@@ -508,6 +518,7 @@
                                     (lambda (vb v)
                                       (set-vbox-body! vb
                                                       (vbody new-id v (vbox-body vb))))))))
+               
                (when (and valid-transaction? (not (queue-empty? (vector-ref (transaction-stack-finalizers t) 0))))
                  (set-transaction-stack-state! t 'finalize)
                  (unless (transaction-record-writes (transaction-stack-record t))
@@ -524,6 +535,9 @@
                  (for ([event (in-queue (vector-ref (transaction-stack-queues t) 0))])
                    (apply (car event) (cdr event))))
                (queue-clear! (vector-ref (transaction-stack-queues t) 0))
+               (hash-clear! (vector-ref (transaction-stack-write-tables t) 0))
+               (hash-clear! (vector-ref (transaction-stack-t-tables t) 0))
+               (set-clear! (transaction-stack-read-set t))
                (set-transaction-stack-state! t 'none)
                valid-transaction?)]))))
                        

@@ -101,6 +101,6 @@
         (printf "popped ~a, count=~a\n" v (deque-count my-deque))
         (cond [v (loop (sub1 remaining))]
               [else (loop remaining)]))))
-  (displayln (format "final restart count: ~a" restart-count))
+  
   )
 

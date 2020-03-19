@@ -183,7 +183,7 @@
   (set! continue? #f)
   (end-atomic)
   (for-each thread-wait thread-pool)
-  (displayln (format "final restart count: ~a" restart-count))
+
   ;  )
     
 
