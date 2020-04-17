@@ -1,9 +1,9 @@
 #lang racket/base
 
-(require ffi/unsafe/atomic (for-syntax racket/base syntax/parse) racket/stxparam racket/set racket/list "heap.rkt" "queue.rkt")
-(provide exn:fail:transaction? exn:fail:transaction:not-in-transaction? completed-write-transactions)
-(provide defer finalizer)
-(provide make-vbox vbox? vbox-ref vbox-set! vbox-cas! transaction-rollback with-transaction
+(require ffi/unsafe/atomic (for-syntax racket/base syntax/parse) racket/set "heap.rkt" "queue.rkt")
+(provide exn:fail:transaction? exn:fail:transaction:not-in-transaction?)
+(provide defer finalizer set-transaction-counter! get-current-timestamp)
+(provide make-vbox vbox? vbox-ref vbox-set! vbox-cas! transaction-rollback with-transaction 
          call-with-mvcc-transaction transaction-mode? read-vbox)
 (provide tbox tbox-ref tbox-set!)
 ;(define atomic-semaphore (make-semaphore 1))
@@ -68,6 +68,20 @@
 
 ;; this is the timestamp
 (define completed-write-transactions 0)
+
+(define (set-transaction-counter! count)
+  (start-atomic)
+  (when (< count completed-write-transactions)
+    (end-atomic)
+    (raise-argument-error 'set-transaction-counter (format "(>=/c ~a)" completed-write-transactions) count))
+  (set! completed-write-transactions count)
+  (end-atomic))
+
+(define (get-current-timestamp)
+  (let ([t (thread-cell-ref current-transaction)])
+    (if (and t (positive? (transaction-stack-count t)))
+        (transaction-stack-id t)
+        completed-write-transactions)))
 
 
 (define (transaction-mode? v)
@@ -707,7 +721,9 @@
 (module+ test
   (require rackunit)
 
-
+  (check-eqv? (get-current-timestamp) 0)
+  (set-transaction-counter! 1000)
+  (check-eqv? (get-current-timestamp) 1000)
   (define counter (make-vbox 0))
   (define t1sema (make-semaphore 0))
   (define thread1
@@ -730,21 +746,26 @@
                   (vbox-ref counter))))))
 
   (semaphore-wait t2sema)
+  (check-eqv? (get-current-timestamp) 1000)
+                
   (thread-send thread1 'go) ; thread 1 will complete and change counter
   (thread-wait thread1)
-
+  (check-eqv? (get-current-timestamp) 1001)
+                
   (check-eqv? (vbox-ref counter) 1)
   (check-eq? (thread-running? thread1) #f)
 
   (thread-send thread2 'go) ; thread 2 should fail and restart
   (semaphore-wait t2sema)
-
+  (check-eqv? (get-current-timestamp) 1001)
+                
   (check-eqv? (vbox-ref counter) 1)
   
   
   (thread-send thread2 'go-again) ; thread 2 should succeed this time
   (thread-wait thread2)
-
+  (check-eqv? (get-current-timestamp) 1002)
+  
   (check-eqv? (vbox-ref counter) 2)
   (check-eq? (thread-running? thread2) #f)
 
