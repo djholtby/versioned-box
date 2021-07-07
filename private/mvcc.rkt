@@ -247,11 +247,12 @@
 ;; make-vbox: X -> (VBoxof X)
 
 (define (make-vbox initial)
-  (if (in-transaction?)
+  #|(if (in-transaction?)
       (let ([new-box (vbox (vbody 0 'invalid #f))]) ;; 
         (vbox-set! new-box initial)
         new-box)
-      (vbox (vbody completed-write-transactions initial #f))))
+      (vbox (vbody completed-write-transactions initial #f))))|#
+  (vbox (vbody completed-write-transactions initial #f)))
 
 ;; (vbox-ref vb) returns vb's value.
 ;; vbox-ref: (VBoxof X) -> X
