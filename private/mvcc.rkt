@@ -546,14 +546,19 @@
                (set-transaction-stack-state! t 'commit)
                (semaphore-post (transaction-stack-semaphore t))
                (queue-clear! (vector-ref (transaction-stack-finalizers t) 0))
-               (when (and valid-transaction? (not (queue-empty? (vector-ref (transaction-stack-queues t) 0))))
-                 (for ([event (in-queue (vector-ref (transaction-stack-queues t) 0))])
-                   (apply (car event) (cdr event))))
+               (define deferred-exception
+                   (when (and valid-transaction? (not (queue-empty? (vector-ref (transaction-stack-queues t) 0))))
+                     (with-handlers ([(λ (e) #t) (λ (e) e)])
+                       (for ([event (in-queue (vector-ref (transaction-stack-queues t) 0))])
+                         (apply (car event) (cdr event)))
+                       (void))))
                (queue-clear! (vector-ref (transaction-stack-queues t) 0))
                (hash-clear! (vector-ref (transaction-stack-write-tables t) 0))
                (hash-clear! (vector-ref (transaction-stack-t-tables t) 0))
                (set-clear! (transaction-stack-read-set t))
                (set-transaction-stack-state! t 'none)
+               (unless (void? deferred-exception)
+                 (raise deferred-exception))
                valid-transaction?)]))))
                        
 
